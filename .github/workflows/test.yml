@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest pyyaml
+      - run: python -m pytest -q tests/
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install pyyaml
+      - run: python tests/dump_fixtures.py --demo /tmp/rl-fixtures.json
+      - run: npm install --no-save react@19 react-dom@19 jsdom@29
+      - run: RUN_LENS_FIXTURES=/tmp/rl-fixtures.json node hermes-plugin/dashboard/render_check.js

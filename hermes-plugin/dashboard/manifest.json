@@ -1,0 +1,10 @@
+{
+  "name": "run-lens",
+  "label": "Runs",
+  "description": "Every Hermes run call by call: tokens, latency, the model that really answered, loops and runaways, and a stop button.",
+  "icon": "Activity",
+  "version": "0.2.0",
+  "tab": { "path": "/runs", "position": "after:skills" },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

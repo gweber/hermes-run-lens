@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*fixtures*.json
+node_modules/
+package-lock.json

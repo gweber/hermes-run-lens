@@ -1,0 +1,108 @@
+# `name` must match dashboard/manifest.json "name" and the API prefix in
+# dashboard/dist/index.js: the dashboard mounts the router under /api/plugins/<name>/
+# and matches plugins.enabled against it.
+manifest_version: 2
+name: run-lens
+version: "0.2.0"
+description: "See every Hermes run call by call — tokens, latency, the model that really answered, each tool call — find loops, runaways and silent fallbacks against each job's own baseline, and stop one run without restarting the gateway."
+author: "Taro Weber"
+license: "MIT"
+homepage: "https://github.com/gweber/hermes-run-lens"
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end
+  - on_session_finalize
+  - subagent_stop
+  - kanban_task_claimed
+  - kanban_task_completed
+  - kanban_task_blocked
+  - on_kanban_worker_spawned
+  - on_kanban_worker_exited
+  - on_kanban_worker_stale_claim
+python_dependencies: []
+tags: [observability, telemetry, cost, loops, cron, kanban, litellm, otel]
+
+# Set under plugins.entries.run-lens.settings in config.yaml. Defaults live in
+# run_lens/settings.py; keep both in step.
+config_schema:
+  breaker:
+    type: string
+    default: cron
+    description: "Which sessions the live breaker may stop: off, cron, cron+kanban, all."
+  breaker_exact_failures:
+    type: integer
+    default: 12
+    description: "Stop after the same tool call (same arguments) failed this many times in one session."
+  breaker_identical_output:
+    type: integer
+    default: 25
+    description: "Stop after this many consecutive LLM replies of exactly the same size."
+  breaker_calls_floor:
+    type: integer
+    default: 80
+    description: "Never stop on call count below this."
+  breaker_calls_factor:
+    type: number
+    default: 6.0
+    description: "Stop when a run exceeds this multiple of its group's p99 call count (and the floor)."
+  tag_litellm:
+    type: string
+    default: auto
+    description: "Add Hermes session and call ids to LiteLLM spend logs: auto (detected proxies only), on, off."
+  litellm_url:
+    type: string
+    default: ""
+    description: "LiteLLM proxy URL. Empty: every provider base_url that answers /health/liveliness."
+  litellm_spend_source:
+    type: string
+    default: auto
+    description: "Where spend logs are read: auto, api (admin key), postgres (DSN), docker (container), off."
+  litellm_admin_key_env:
+    type: string
+    default: LITELLM_MASTER_KEY
+    description: "Name of the env var holding a LiteLLM admin key (for the api source). Never the key itself."
+  litellm_postgres_dsn_env:
+    type: string
+    default: LITELLM_DATABASE_URL
+    description: "Name of the env var holding the LiteLLM database DSN (for the postgres source)."
+  litellm_docker_container:
+    type: string
+    default: ""
+    description: "Container running LiteLLM's Postgres (for the docker source)."
+  litellm_backfill_days:
+    type: integer
+    default: 14
+    description: "How far back the first LiteLLM ingest reads."
+  store_path:
+    type: string
+    default: ""
+    description: "SQLite store. Empty: <default home>/plugin-data/run-lens/lens.db."
+  retention_days:
+    type: integer
+    default: 90
+    description: "Per-call detail older than this is pruned; sessions and findings are kept. 0 keeps everything."
+  preview_chars:
+    type: integer
+    default: 240
+    description: "Length of the redacted argument and result previews."
+  watch_schedule:
+    type: string
+    default: "*/5 * * * *"
+    description: "Schedule of the run-lens-watch cron job created by `hermes lens setup`."
+  watch_deliver:
+    type: string
+    default: local
+    description: "Where new findings are delivered, e.g. telegram:<chat_id>."
+  watch_severity:
+    type: string
+    default: high
+    description: "Lowest severity the watch job reports: warn, high, critical."
+  watch_window:
+    type: string
+    default: 3h
+    description: "How far back each watch tick looks for new findings."
