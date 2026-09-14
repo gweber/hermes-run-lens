@@ -7,6 +7,10 @@
   OpenRouter lane), one finding per profile/task/error signature at ≥3 in 24 h (paid lane ≥1),
   and `aux_notify: kanban` to hand each new one to a profile as a kanban card. Off by default.
 - `hermes lens watch --dry-run`.
+- A capped run is reported once: the live hook's finding for a compressed child session is merged
+  into the run's finding (one ops run on 2026-09-14 was reported twice).
+- Aux-failure cards tell the worker to check recent commits first and to report by ~60 calls or
+  block; the first card cost a 250-call run to rediscover a fix that was already committed.
 
 ## 0.2.0 — 2026-09-13
 

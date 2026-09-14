@@ -76,6 +76,12 @@ def card_for(finding: dict) -> dict:
         lines.append("    logger: " + ", ".join(ev["loggers"]))
     lines += [
         "",
+        "Before digging: check whether it is already being fixed — `git -C " + str(checkout) + " log --oneline "
+        "--since='2 days ago' -- " + " ".join(CODE_HINTS.get(task, DEFAULT_HINT)) + "` and the last failure time above. "
+        "A fix that is committed but not yet live (gateway not restarted) needs no investigation: say so and stop.",
+        "Budget: this is a diagnosis card. Post what you found as a kanban_comment by about 60 calls. If the fix "
+        "needs a human (restart, sudo, a config decision), kanban_block naming exactly that instead of working around it.",
+        "",
         "Done when: the cause is fixed (or the behaviour is deliberately configured) and no new matching lines "
         "appear. Then `hermes lens resolve " + str(finding.get("id", "<id>")) + "`; if it fails again later, "
         "run-lens opens a new card.",

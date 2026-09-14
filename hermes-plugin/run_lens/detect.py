@@ -133,6 +133,7 @@ def _cap_hit(c: _RunCtx) -> int:
         return 0
     r = rows[-1]
     halted = r["exit_reason"] == "guardrail_halt"
+    _merge_live_cap_findings(c)
     return c.finding(
         "cap.guardrail_halt" if halted else "cap.max_iterations", "warn" if halted else "high",
         f"{c.label}: {'stopped by the loop guardrail' if halted else 'ran into its call cap'} "
@@ -141,6 +142,21 @@ def _cap_hit(c: _RunCtx) -> int:
         evidence={"exit_reason": r["exit_reason"], "api_calls": r["api_calls"], "max": r["max_iterations"],
                   "turns_at_cap": len(rows)},
         suggestion=None if halted else _cap_suggestion(c))
+
+
+def _merge_live_cap_findings(c: _RunCtx) -> None:
+    """The recorder flags a cap hit live, keyed on the session it saw. After a compression that is a
+    child session, so one capped run was reported twice (t_fd4b3b09, 2026-09-14): once per child from
+    the hook, once per root from here. The root finding speaks for the run; the children's copies are
+    closed and marked notified before the watch reports anything."""
+    children = [m for m in c.members if m != c.run["root_id"]]
+    if not children:
+        return
+    ph = ",".join("?" for _ in children)
+    c.conn.execute(
+        f"UPDATE findings SET state='resolved', notified_at=COALESCE(notified_at, ?) WHERE origin='hook' "
+        f"AND kind IN ('cap.max_iterations','cap.guardrail_halt') AND session_id IN ({ph})",
+        (c.now, *children))
 
 
 def _cap_suggestion(c: _RunCtx) -> str | None:

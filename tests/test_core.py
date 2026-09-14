@@ -158,6 +158,25 @@ def test_detectors_fire_on_a_capped_loop(env):
     assert sug and "cap near" in sug
 
 
+def test_live_cap_finding_of_a_compressed_child_is_merged_into_the_run(env):
+    from run_lens import detect
+    from run_lens.store import Tx
+    c = env["conn"]
+    sid = _loop_run(c)
+    child = sid + "_child"
+    with Tx(c):
+        c.execute("INSERT INTO sessions(id, root_id, parent_id, profile, source, started_at) VALUES(?,?,?,?,?,?)",
+                  (child, sid, sid, "research", "cron", time.time() - 100))
+        detect.upsert_finding(c, kind="cap.max_iterations", severity="high", fingerprint=f"cap.max_iterations:{child}",
+                              title=f"{child}: turn ended — max_iterations_reached(60/60)", session_id=child,
+                              origin="hook")
+    detect.run_all(c, since=time.time() - 86400)
+    live = c.execute("SELECT state, notified_at FROM findings WHERE fingerprint=?", (f"cap.max_iterations:{child}",)).fetchone()
+    assert live["state"] == "resolved" and live["notified_at"]
+    root = c.execute("SELECT state, notified_at FROM findings WHERE fingerprint=?", (f"cap.max_iterations:{sid}",)).fetchone()
+    assert root["state"] == "open" and root["notified_at"] is None
+
+
 def test_baseline_excludes_flagged_runs(env):
     from run_lens import baseline, detect
     c = env["conn"]
