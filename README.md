@@ -141,7 +141,19 @@ plugins:
         litellm_docker_container: ""        # e.g. litellm-db
         retention_days: 90
         watch_deliver: local                # e.g. telegram:<chat_id>
+        aux_notify: "off"                   # off | print | kanban
+        aux_card_board: spark
+        aux_card_assignee: ops
 ```
+
+**Failing auxiliary tasks.** Background memory/skill reviews, title generation, context
+summaries and auxiliary fallback chains fail without the user's turn noticing. run-lens
+reads their failure lines from every profile's `agent.log`, groups them by profile, task
+and a normalised error signature, and opens one finding per problem once it happens 3×
+in 24 h (the paid OpenRouter lane: once). With `aux_notify: kanban` the watch job turns
+each new one into a card on `aux_card_board` for `aux_card_assignee` instead of a message
+(and prints it if the card cannot be created); `hermes lens watch --dry-run` shows what it
+would create.
 
 LiteLLM restricts its spend-log API to the proxy admin. `auto` uses, in order: the API if
 the env var named by `litellm_admin_key_env` is set; the database if the env var named by

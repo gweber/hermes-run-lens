@@ -106,3 +106,15 @@ config_schema:
     type: string
     default: 3h
     description: "How far back each watch tick looks for new findings."
+  aux_notify:
+    type: string
+    default: "off"
+    description: "What the watch job does with a new failing-auxiliary-task finding: off (dashboard and `hermes lens findings` only), print (delivered like other findings), kanban (a card on aux_card_board for aux_card_assignee; printed if the card cannot be created)."
+  aux_card_board:
+    type: string
+    default: spark
+    description: "Kanban board for aux_notify: kanban."
+  aux_card_assignee:
+    type: string
+    default: ops
+    description: "Profile the aux_notify: kanban cards are assigned to."

@@ -330,3 +330,230 @@ def test_retention_prunes_detail_only(env):
     ingest.prune(c)
     assert c.execute("SELECT COUNT(*) FROM calls").fetchone()[0] == 0
     assert c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+
+
+# ── failing auxiliary tasks ───────────────────────────────────────────
+
+AUX_LOG = """2026-09-14 04:45:53,100 WARNING [20260914_044553_64cd33] agent.background_review: Background memory/skill review failed: [Errno 2] No such file or directory
+2026-09-14 04:45:53,120 INFO [20260914_044553_64cd33] agent.background_review: Background review complete: thread=bg-review calls=0 in=0 out=0 cache_read=0 result=error
+2026-09-14 06:15:06,000 WARNING [20260914_061506_96b17c] agent.background_review: Background memory/skill review failed: [Errno 2] No such file or directory
+2026-09-14 06:15:06,010 INFO [20260914_061506_96b17c] agent.background_review: Background review complete: thread=bg-review calls=0 in=0 out=0 cache_read=0 result=error
+2026-09-14 07:00:00,000 INFO [20260914_070000_aaaaaa] agent.background_review: Background review complete: thread=bg-review calls=0 in=0 out=0 cache_read=0 result=error
+2026-09-14 07:01:00,000 INFO [20260914_070100_bbbbbb] agent.background_review: Background review complete: thread=bg-review calls=3 in=10 out=2 cache_read=0 result=none
+2026-09-14 08:00:00,000 WARNING agent.title_generator: Title generation failed: 'CommandTokenSource' object has no attribute 'strip'
+2026-09-14 08:01:00,000 WARNING agent.auxiliary_client: Auxiliary vision (async): connection error on custom and all fallbacks exhausted (fallback_chain + main agent model). Raising original error.
+2026-09-14 08:02:00,000 WARNING agent.context_compressor: Failed to generate context summary: Request timed out.. Further summary attempts paused for 300 seconds.
+2026-09-14 08:03:00,000 ERROR [cron_12afe09e646e_20260910_051956] agent.conversation_loop: Context compression failed after 3 attempts.
+2026-09-14 08:04:00,000 WARNING agent.auxiliary_client: Auxiliary client: PAID lane engaged for auxiliary task — OpenRouter fallback model 'google/gemini-3.6-flash' is not a :free SKU and may incur real spend.
+2026-09-14 08:05:00,000 WARNING agent.auxiliary_client: Auxiliary: marking openrouter unhealthy for 60s (payment / credit error). Subsequent auxiliary calls will skip it until 16:50:28.
+2026-09-14 08:06:00,000 WARNING [20260914_080600_cccccc] agent.conversation_loop: API call failed (attempt 1/3) error_type=timeout model=big summary=boom
+"""
+
+
+def test_aux_signature_normalises_ids_numbers_paths():
+    from run_lens.ingest.agentlog import aux_signature
+    assert aux_signature("[Errno 2] No such file or directory") == "[Errno <n>] No such file or directory"
+    a = aux_signature("FileNotFoundError: [Errno 2] No such file or directory: '/home/taro/.hermes/profiles/ops/x.md'")
+    b = aux_signature("FileNotFoundError: [Errno 2] No such file or directory: '/tmp/other/y.json'")
+    assert a == b == "FileNotFoundError: [Errno <n>] No such file or directory: '<path>'"
+    assert aux_signature("session 20260914_151927_54286d id 3f9a0c1bde77 at http://localhost:4000/v1 took 12.5s") == \
+        "session <id> id <id> at <url> took <n>s"
+    # repr'd provider errors keep their first line only
+    long = "Error code: 500 - {'error': {'message': \"litellm.X: Connection error.. Received Model Group=big\\nAvailable"
+    assert aux_signature(long).endswith("Model Group=big")
+    assert len(aux_signature("x" * 500)) <= 160
+
+
+def test_aux_patterns():
+    from run_lens.ingest.agentlog import aux_match
+    m = lambda lg, msg: (aux_match(lg, msg) or (None, None, None))[:2]
+    assert m("agent.background_review", "Background memory/skill review failed: [Errno 2] No such file or directory") == \
+        ("background_review", "[Errno <n>] No such file or directory")
+    assert m("agent.background_review", "Background review complete: thread=bg-review calls=0 result=error") == \
+        ("background_review", "result=error")
+    assert m("agent.background_review", "Background review complete: thread=bg-review calls=0 result=none") == (None, None)
+    assert m("agent.title_generator", "Title generation failed: Request timed out.") == \
+        ("title_generation", "Request timed out")
+    assert m("agent.auxiliary_client", "Auxiliary title_generation: connection error on auto and no fallback "
+                                       "available (tried: openrouter)") == \
+        ("title_generation", "connection error on auto; no fallback available")
+    assert m("agent.auxiliary_client", "Auxiliary compression: connection error on custom:litellm and all fallbacks "
+                                       "exhausted (fallback_chain + main agent model).") == \
+        ("compression", "connection error on custom:litellm; all fallbacks exhausted")
+    assert m("agent.context_compressor", "Failed to generate context summary: Connection error.. Further summary "
+                                         "attempts paused for 30 seconds.") == ("compression", "Connection error")
+    assert m("agent.conversation_loop", "Context compression failed after 3 attempts; rebuilt request") == \
+        ("compression", "context compression failed after <n> attempts")
+    assert m("agent.auxiliary_client", "Auxiliary client: PAID lane engaged for auxiliary task — OpenRouter fallback "
+                                       "model 'google/gemini-3.6-flash' is not a :free SKU") == \
+        ("paid_lane", "paid fallback model google/gemini-<n>-flash")
+    # the wrong logger, and per-call noise, do not count
+    assert m("tools.registry", "Title generation failed: x") == (None, None)
+    assert m("agent.auxiliary_client", "Auxiliary: marking openrouter unhealthy for 60s") == (None, None)
+
+
+def _aux_ingest(env, text=AUX_LOG, profile_dir=None):
+    from run_lens.ingest import agentlog
+    logs = (profile_dir or env["home"]) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "agent.log").write_text(text)
+    return agentlog.ingest(env["conn"])
+
+
+def test_aux_events_from_log(env):
+    rep = _aux_ingest(env)
+    c = env["conn"]
+    rows = [json.loads(r["detail"]) for r in c.execute("SELECT detail FROM events WHERE kind='aux.failed' ORDER BY at")]
+    tasks = [(d["task"], d["sig"]) for d in rows]
+    # a failed review is counted once (its "complete result=error" line is its echo); a bare result=error counts
+    assert tasks.count(("background_review", "[Errno <n>] No such file or directory")) == 2
+    assert tasks.count(("background_review", "result=error")) == 1
+    assert ("vision", "connection error on custom; all fallbacks exhausted") in tasks
+    assert ("paid_lane", "paid fallback model google/gemini-<n>-flash") in tasks
+    assert len(rows) == 8 and rep["aux_failed"] == 8
+    assert all(d["profile"] == "default" and d["file"].endswith("agent.log") and d["line"] for d in rows)
+    assert c.execute("SELECT COUNT(*) FROM events WHERE kind='api.error'").fetchone()[0] == 1
+
+
+def test_aux_backfill_reads_behind_the_offset_once(env):
+    from run_lens.ingest import agentlog
+    from run_lens.store import Tx, set_watermark
+    c = env["conn"]
+    log = env["home"] / "logs" / "agent.log"
+    log.write_text(AUX_LOG)
+    st = log.stat()
+    with Tx(c):  # an install that had already read this log before aux events existed
+        set_watermark(c, f"log:{st.st_dev}:{st.st_ino}", st.st_size)
+    rep = agentlog.ingest(c)
+    assert rep["aux_backfill"] == 8
+    assert "aux_backfill" not in agentlog.ingest(c)
+    assert c.execute("SELECT COUNT(*) FROM events WHERE kind='aux.failed'").fetchone()[0] == 8
+
+
+def _aux_events(c, profile, task, sig, times, file="/h/logs/agent.log"):
+    from run_lens.store import Tx
+    with Tx(c):
+        for i, t in enumerate(times):
+            c.execute("INSERT INTO events(at, kind, session_id, detail, origin, dedupe) VALUES(?,?,?,?,?,?)",
+                      (t, "aux.failed", f"s{i}", json.dumps({"profile": profile, "task": task, "sig": sig,
+                                                            "line": f"line {i}", "file": file}), "log",
+                       f"{profile}{task}{sig}{t}"))
+
+
+def test_aux_detector_threshold_and_fingerprint(env):
+    from run_lens import detect
+    c = env["conn"]
+    now = time.time()
+    _aux_events(c, "ops", "background_review", "[Errno <n>] No such file", [now - 7200, now - 3600])
+    _aux_events(c, "ops", "title_generation", "old", [now - 90000, now - 89000, now - 3600])  # 2 of 3 are >24 h
+    _aux_events(c, "writer", "paid_lane", "paid fallback model x", [now - 60])
+    detect.run_all(c, now=now)
+    assert c.execute("SELECT COUNT(*) FROM findings WHERE kind='aux.failed'").fetchone()[0] == 1  # paid lane: ≥1
+    _aux_events(c, "ops", "background_review", "[Errno <n>] No such file", [now - 30])
+    detect.run_all(c, now=now)
+    fps = {r["fingerprint"]: dict(r) for r in c.execute("SELECT * FROM findings WHERE kind='aux.failed'")}
+    fp = "aux.failed:ops:background_review:[Errno <n>] No such file"
+    assert set(fps) == {fp, "aux.failed:writer:paid_lane:paid fallback model x"}
+    ev = json.loads(fps[fp]["evidence"])
+    assert ev["count_24h"] == 3 and ev["samples"] == ["line 0", "line 1", "line 0"] and ev["files"] == ["/h/logs/agent.log"]
+    assert abs(fps[fp]["first_seen"] - (now - 7200)) < 1 and fps[fp]["severity"] == "warn"
+    assert fps["aux.failed:writer:paid_lane:paid fallback model x"]["severity"] == "high"
+    # next day, same problem: the same finding, not a second one
+    _aux_events(c, "ops", "background_review", "[Errno <n>] No such file", [now + 86400 + i for i in range(3)])
+    detect.run_all(c, now=now + 86400 + 10)
+    assert c.execute("SELECT COUNT(*) FROM findings WHERE fingerprint=?", (fp,)).fetchone()[0] == 1
+
+
+def test_aux_resolved_reopens_only_on_recurrence(env):
+    from run_lens import cards, detect
+    from run_lens.store import Tx
+    c = env["conn"]
+    now = time.time()
+    _aux_events(c, "ops", "compression", "Connection error", [now - 300, now - 200, now - 100])
+    detect.run_all(c, now=now)
+    f = dict(c.execute("SELECT * FROM findings WHERE kind='aux.failed'").fetchone())
+    key1 = cards.idempotency_key(f)
+    with Tx(c):
+        c.execute("UPDATE findings SET state='resolved', notified_at=? WHERE id=?", (now, f["id"]))
+    detect.run_all(c, now=now + 5)
+    assert c.execute("SELECT state FROM findings WHERE id=?", (f["id"],)).fetchone()[0] == "resolved"
+    _aux_events(c, "ops", "compression", "Connection error", [now + 50])
+    detect.run_all(c, now=now + 60)
+    g = dict(c.execute("SELECT * FROM findings WHERE id=?", (f["id"],)).fetchone())
+    assert g["state"] == "open" and g["notified_at"] is None and cards.idempotency_key(g) != key1
+
+
+class _Done:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def _watch_args(**kw):
+    import argparse
+    return argparse.Namespace(**{"since": None, "severity": None, "json": False, "dry_run": False, **kw})
+
+
+def test_watch_creates_kanban_cards_silently(env, monkeypatch, capsys):
+    from run_lens import cards, cli, ingest, settings
+    c = env["conn"]
+    (env["home"] / "config.yaml").write_text(
+        "plugins:\n  entries:\n    run-lens:\n      settings:\n        aux_notify: kanban\n")
+    settings.load(refresh=True)
+    monkeypatch.setattr(ingest, "run", lambda conn, **kw: {})
+    now = time.time()
+    _aux_events(c, "ops", "background_review", "[Errno <n>] No such file or directory", [now - 300, now - 200, now - 100])
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return _Done(stdout="  Command helper: applied 8 secrets\n" + json.dumps({"id": "t_abc123", "title": "x"}))
+
+    monkeypatch.setattr(cards.subprocess, "run", fake_run)
+    assert cli.cmd_watch(c, _watch_args()) == 0
+    assert capsys.readouterr().out == ""
+    argv = calls[0]
+    i = argv.index("kanban")
+    assert argv[i:i + 4] == ["kanban", "--board", "spark", "create"]
+    assert argv[argv.index("--assignee") + 1] == "ops"
+    body = argv[argv.index("--body") + 1]
+    assert "background_review" in body and "3 in the last 24 h" in body and "line 2" in body
+    assert "agent/background_review.py" in body and "/h/logs/agent.log" in body
+    assert argv[argv.index("--idempotency-key") + 1].startswith("run-lens-")
+    f = c.execute("SELECT notified_at, suggestion FROM findings WHERE kind='aux.failed'").fetchone()
+    assert f["notified_at"] and "t_abc123" in f["suggestion"]
+    cli.cmd_watch(c, _watch_args())  # already notified: no second create
+    assert len(calls) == 1
+    settings.load(refresh=True)
+
+
+def test_watch_prints_when_card_creation_fails(env, monkeypatch, capsys):
+    from run_lens import cards, cli, ingest, settings
+    c = env["conn"]
+    (env["home"] / "config.yaml").write_text(
+        "plugins:\n  entries:\n    run-lens:\n      settings:\n        aux_notify: kanban\n")
+    settings.load(refresh=True)
+    monkeypatch.setattr(ingest, "run", lambda conn, **kw: {})
+    _aux_events(c, "writer", "paid_lane", "paid fallback model x", [time.time() - 10])
+    monkeypatch.setattr(cards.subprocess, "run", lambda argv, **kw: _Done(stderr="kanban: no such board", returncode=2))
+    cli.cmd_watch(c, _watch_args())
+    out = capsys.readouterr().out
+    assert "writer: PAID OpenRouter lane engaged 1×" in out and "could not be created (kanban: no such board)" in out
+    assert c.execute("SELECT notified_at FROM findings WHERE kind='aux.failed'").fetchone()[0]
+    settings.load(refresh=True)
+
+
+def test_watch_aux_off_and_dry_run_touch_nothing(env, monkeypatch, capsys):
+    from run_lens import cards, cli, ingest, settings
+    c = env["conn"]
+    settings.load(refresh=True)  # default aux_notify: off
+    monkeypatch.setattr(ingest, "run", lambda conn, **kw: {})
+    monkeypatch.setattr(cards.subprocess, "run", lambda *a, **kw: pytest.fail("must not create a card"))
+    now = time.time()
+    _aux_events(c, "ops", "compression", "Connection error", [now - 300, now - 200, now - 100])
+    cli.cmd_watch(c, _watch_args())
+    assert capsys.readouterr().out == ""
+    cli.cmd_watch(c, _watch_args(dry_run=True))
+    out = capsys.readouterr().out
+    assert "(dry run)" in out and "ops / compression / Connection error — 3×" in out
+    assert c.execute("SELECT notified_at FROM findings WHERE kind='aux.failed'").fetchone()[0] is None
+

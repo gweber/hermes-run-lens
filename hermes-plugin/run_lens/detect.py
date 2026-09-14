@@ -36,6 +36,10 @@ PROMPT_BIG = 120_000
 IDENTICAL_STREAK = 10
 EXACT_FAILURES = 5
 ACTIVE_STALE_S = 600
+AUX_WINDOW_S = 86400
+AUX_THRESHOLD = 3
+AUX_THRESHOLD_BY_TASK = {"paid_lane": 1}   # real money: one occurrence is enough
+AUX_SAMPLES = 3
 
 
 def upsert_finding(conn: sqlite3.Connection, *, kind: str, severity: str, fingerprint: str, title: str,
@@ -96,7 +100,7 @@ def run_all(conn: sqlite3.Connection, since: float | None = None, now: float | N
                 except Exception as exc:  # a detector bug must not hide the others
                     counts[f"{det.__name__}_error"] += 1
                     counts[f"err:{type(exc).__name__}:{exc}"[:120]] += 1
-        for det in (_served_fallback, _cron_overlap, _settle_waste, _model_hog, _kanban_failures):
+        for det in (_served_fallback, _cron_overlap, _settle_waste, _model_hog, _kanban_failures, _aux_failures):
             try:
                 counts[det.__name__] += det(conn, since, now, jobs) or 0
             except Exception as exc:
@@ -390,5 +394,69 @@ def _kanban_failures(conn, since, now, jobs) -> int:
                        title=f"kanban {r['task_id']} ({r['profile']}): run {r['outcome']}",
                        detail=(r["title"] or "")[:200], evidence={"board": r["board"], "error": r["error"]},
                        session_id=r["session_id"], at=r["ended_at"] or r["started_at"])
+        n += 1
+    return n
+
+
+def aux_fingerprint(profile: str, task: str, sig: str) -> str:
+    # No date: one finding per problem, however many days it keeps failing.
+    return f"aux.failed:{profile}:{task}:{sig}"
+
+
+def _aux_failures(conn, since, now, jobs) -> int:
+    """Auxiliary tasks that keep failing: the same (profile, task, error signature) ≥3× in 24 h.
+
+    Fixed window, independent of `since`: the threshold is "per day", and a watch tick
+    with a 3 h window must still see the day. A resolved finding stays resolved until
+    the problem shows up again after it was last seen; then it reopens as a new episode
+    (first_seen moves, notified_at clears) so it is reported once more.
+    """
+    groups: dict[tuple, dict] = {}
+    for r in conn.execute("SELECT at, session_id, detail FROM events WHERE kind='aux.failed' AND at >= ? AND at <= ? "
+                          "ORDER BY at", (now - AUX_WINDOW_S, now)):
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except Exception:
+            continue
+        key = (d.get("profile") or "?", d.get("task") or "?", d.get("sig") or "?")
+        g = groups.setdefault(key, {"ats": [], "lines": [], "files": set(), "sessions": [], "loggers": set()})
+        g["ats"].append(r["at"])
+        if d.get("line"):
+            g["lines"].append(d["line"])
+        if d.get("file"):
+            g["files"].add(d["file"])
+        if d.get("logger"):
+            g["loggers"].add(d["logger"])
+        if r["session_id"] and r["session_id"] not in g["sessions"]:
+            g["sessions"].append(r["session_id"])
+    n = 0
+    for (profile, task, sig), g in groups.items():
+        threshold = AUX_THRESHOLD_BY_TASK.get(task, AUX_THRESHOLD)
+        count = len(g["ats"])
+        if count < threshold:
+            continue
+        fp = aux_fingerprint(profile, task, sig)
+        row = conn.execute("SELECT id, state, last_seen FROM findings WHERE fingerprint=?", (fp,)).fetchone()
+        first, last = g["ats"][0], g["ats"][-1]
+        recurred = False
+        if row is not None and row["state"] == "resolved":
+            if last <= (row["last_seen"] or 0) + 1:
+                continue  # resolved, and nothing new since
+            recurred = True
+            first = min(a for a in g["ats"] if a > (row["last_seen"] or 0) + 1)
+        what = "PAID OpenRouter lane engaged" if task == "paid_lane" else f"{task} failed"
+        upsert_finding(
+            conn, kind="aux.failed", severity="high" if task == "paid_lane" else "warn", fingerprint=fp,
+            title=f"{profile}: {what} {count}× in 24 h — {sig[:90]}",
+            detail="An auxiliary task failed in the background; the user's turn still answered, so nothing else "
+                   "shows it.",
+            evidence={"profile": profile, "task": task, "signature": sig, "count_24h": count, "threshold": threshold,
+                      "first": first, "last": last, "samples": g["lines"][-AUX_SAMPLES:],
+                      "files": sorted(g["files"]), "loggers": sorted(g["loggers"]), "sessions": g["sessions"][-5:]},
+            at=last)
+        if row is None:
+            conn.execute("UPDATE findings SET first_seen=? WHERE fingerprint=?", (first, fp))
+        elif recurred:
+            conn.execute("UPDATE findings SET first_seen=?, notified_at=NULL WHERE fingerprint=?", (first, fp))
         n += 1
     return n

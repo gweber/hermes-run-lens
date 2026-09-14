@@ -6,7 +6,7 @@ import json
 import sys
 import time
 
-from . import control, detect, export, fmt, ingest, paths, query, settings
+from . import cards, control, detect, export, fmt, ingest, paths, query, settings
 from .store import Tx, connect
 
 
@@ -72,6 +72,9 @@ def setup(parser: argparse.ArgumentParser) -> None:
     p.add_argument("--since", default=None, help="default: settings.watch_window (3h)")
     p.add_argument("--severity", choices=("warn", "high", "critical"), default=None,
                    help="default: settings.watch_severity (high)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would be delivered and which kanban cards would be created; create nothing, "
+                        "mark nothing as notified")
 
     p = sub.add_parser("setup", help="create or update the watch cron job (no LLM; silent unless something is wrong)")
     p.add_argument("--deliver", default=None, help="delivery target, e.g. telegram:<chat_id> (default: settings.watch_deliver)")
@@ -372,9 +375,12 @@ def cmd_watch(conn, args):
     # Only what was seen inside the window: a manual `detect --since 14d` must not turn
     # two weeks of history into a burst of notifications on the next tick.
     fs = [f for f in query.findings(conn, state="open", min_severity=args.severity, since=since, limit=50)
-          if not f.get("notified_at")]
+          if not f.get("notified_at") and f["kind"] != "aux.failed"]
+    fs += _watch_aux(conn, args)
     if not fs:
         return 0
+    if args.dry_run:
+        print(f"(dry run) would deliver {len(fs)} finding(s):")
     if _out(args, fs):
         pass
     else:
@@ -388,11 +394,54 @@ def cmd_watch(conn, args):
         if len(fs) > 10:
             lines.append(f"… and {len(fs) - 10} more: hermes lens findings")
         print("\n".join(lines))
+    if args.dry_run:
+        return 0
     with Tx(conn):
         now = time.time()
         for f in fs:
             conn.execute("UPDATE findings SET notified_at=? WHERE id=?", (now, f["id"]))
     return 0
+
+
+def _watch_aux(conn, args) -> list:
+    """New aux.failed findings: a kanban card each (aux_notify: kanban), or delivered like the rest (print).
+
+    Returns the findings still to be printed. A card that was created marks its finding
+    notified here, so the tick's output stays empty; a card that could not be created
+    falls back to the printed notification. `off` leaves them unnotified, so switching
+    to kanban later still turns the last day's findings into cards.
+    """
+    mode = str(settings.get("aux_notify") or "off")
+    new = [f for f in query.findings(conn, state="open", min_severity="info", since=time.time() - detect.AUX_WINDOW_S,
+                                     limit=200) if f["kind"] == "aux.failed" and not f.get("notified_at")]
+    if not new:
+        return []
+    board, assignee = settings.get("aux_card_board") or "spark", settings.get("aux_card_assignee") or "ops"
+    if args.dry_run:
+        print(f"(dry run) aux_notify={mode}; {len(new)} new aux.failed finding(s) → cards on board {board!r} "
+              f"for {assignee!r} when aux_notify is kanban:")
+        for f in new:
+            card = cards.card_for(f)
+            ev = f["evidence"] if isinstance(f["evidence"], dict) else {}
+            print(f"• {ev.get('profile')} / {ev.get('task')} / {ev.get('signature')} — {ev.get('count_24h')}× in 24 h"
+                  f"\n  card: {card['title']}\n  key:  {card['key']}")
+        print()
+        return []
+    if mode == "print":
+        return new
+    if mode != "kanban":
+        return []
+    leftover = []
+    for f in new:
+        ok, res = cards.create(cards.card_for(f), board, assignee)
+        if not ok:
+            f["suggestion"] = f"kanban card could not be created ({res[:160]})"
+            leftover.append(f)
+            continue
+        with Tx(conn):
+            conn.execute("UPDATE findings SET notified_at=?, suggestion=? WHERE id=?",
+                         (time.time(), f"kanban card {res} on board {board} for {assignee}", f["id"]))
+    return leftover
 
 
 def cmd_doctor(conn, args):

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Failing auxiliary tasks: `aux.failed` events from every profile's agent log (background
+  review, title generation, context summaries, exhausted auxiliary fallbacks, the paid
+  OpenRouter lane), one finding per profile/task/error signature at ≥3 in 24 h (paid lane ≥1),
+  and `aux_notify: kanban` to hand each new one to a profile as a kanban card. Off by default.
+- `hermes lens watch --dry-run`.
+
 ## 0.2.0 — 2026-09-13
 
 First public release.

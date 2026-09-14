@@ -48,6 +48,10 @@ DEFAULTS: dict[str, Any] = {
     "watch_deliver": "local",
     "watch_severity": "high",
     "watch_window": "3h",
+    # failing auxiliary tasks (aux.failed findings)
+    "aux_notify": "off",                  # off | print | kanban
+    "aux_card_board": "spark",
+    "aux_card_assignee": "ops",
 }
 
 _cache: dict[str, Any] | None = None

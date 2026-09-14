@@ -13,6 +13,12 @@ a line that does not start with a timestamp continues the previous record.
 
 Log timestamps are local time (Python logging default); they are converted with the
 host's timezone.
+
+Auxiliary tasks (background memory/skill review, title generation, context summaries,
+auxiliary fallback chains, the paid OpenRouter lane) fail in the background: the user's
+turn still answers, so nobody notices. Each failure line becomes one `aux.failed` event
+with the profile whose log it came from, the task, and a normalised error signature
+(ids, numbers and paths replaced by placeholders), which detect.py groups.
 """
 from __future__ import annotations
 
@@ -48,14 +54,76 @@ CRON = [
 ]
 MATCH_WINDOW_S = 5.0
 
+# (task, loggers, pattern). The first group, where there is one, is the error text.
+# Per-API-call failure lines are deliberately not here: a task's
+# own "failed"/"complete" line counts it once.
+AUX_PATTERNS = [
+    ("background_review", {"agent.background_review"}, re.compile(r"review failed: (.*)", re.S)),
+    ("background_review", {"agent.background_review"},
+     re.compile(r"Background review complete: .*\bresult=error\b")),
+    ("title_generation", {"agent.title_generator"}, re.compile(r"Title generation failed: (.*)", re.S)),
+    ("compression", {"agent.context_compressor"}, re.compile(r"Failed to generate context summary: (.*?)(?:\. Further summary attempts paused.*)?$", re.S)),
+    ("compression", {"agent.conversation_loop", "agent.turn_overflow"}, re.compile(r"Context compression failed after (\d+) attempts")),
+    ("paid_lane", {"agent.auxiliary_client"}, re.compile(r"PAID lane engaged for auxiliary task(.*)", re.S)),
+    # task comes from the line: "Auxiliary vision (async): connection error on custom and all fallbacks exhausted"
+    ("*", {"agent.auxiliary_client"},
+     re.compile(r"Auxiliary (\w+)(?: \(\w+\))?: (.+?) and (all fallbacks exhausted|no fallback available)", re.S)),
+]
+AUX_BACKFILL_KEY = "log:aux-backfill:v1"
+_SIG_RULES = [
+    (re.compile(r"\b\w+://\S+"), "<url>"),
+    (re.compile(r"(?:~|\.{1,2})?(?:/[\w.@+-]+){2,}/?"), "<path>"),
+    (re.compile(r"\b(?:cron_\w+?_)?\d{8}_\d{6}_\w+\b"), "<id>"),
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "<id>"),
+    (re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\b", re.I), "<id>"),
+    (re.compile(r"\b0x[0-9a-f]+\b", re.I), "<id>"),
+    (re.compile(r"\d+(?:[.:,]\d+)*"), "<n>"),
+]
+SIG_CHARS = 160
+
 
 def _ts(date: str, ms: str) -> float:
     return dt.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").timestamp() + int(ms) / 1000.0
 
 
-def log_files() -> list[Path]:
+def aux_signature(error: str) -> str:
+    """The part of an error message that stays the same across occurrences of one problem."""
+    s = (error or "").split("\n", 1)[0]
+    s = s.replace("\\n", "\n").split("\n", 1)[0]  # repr'd provider messages: keep their first line
+    for rx, repl in _SIG_RULES:
+        s = rx.sub(repl, s)
+    s = re.sub(r"\s+", " ", s).strip().rstrip(".:;, ")
+    return s[:SIG_CHARS] or "?"
+
+
+def aux_match(logger: str, msg: str) -> tuple[str, str, str] | None:
+    """(task, signature, error text) for a line that reports a failed auxiliary task."""
+    for task, loggers, rx in AUX_PATTERNS:
+        if logger not in loggers:
+            continue
+        m = rx.search(msg)
+        if not m:
+            continue
+        if task == "*":
+            error = f"{m.group(2)}; {m.group(3)}"
+            return m.group(1), aux_signature(error), error
+        if task == "paid_lane":
+            model = re.search(r"model '([^']+)'", msg)
+            error = f"paid fallback model {model.group(1)}" if model else "paid lane engaged"
+            return task, aux_signature(error), msg
+        if "result=error" in rx.pattern:
+            return task, "result=error", msg
+        if "Context compression failed" in rx.pattern:
+            return task, aux_signature(f"context compression failed after {m.group(1)} attempts"), msg
+        error = m.group(1)
+        return task, aux_signature(error), error
+    return None
+
+
+def log_files() -> list[tuple[str, Path]]:
+    """(profile, path) for every agent log, oldest rotation first within a profile."""
     out = []
-    for _profile, home in paths.homes():
+    for profile, home in paths.homes():
         d = home / "logs"
         if not d.is_dir():
             continue
@@ -63,7 +131,7 @@ def log_files() -> list[Path]:
         for name in ("agent.log.3", "agent.log.2", "agent.log.1", "agent.log"):
             p = d / name
             if p.exists():
-                out.append(p)
+                out.append((profile, p))
     return out
 
 
@@ -93,7 +161,11 @@ def _records(path: Path, offset: int):
 def ingest(conn: sqlite3.Connection, full: bool = False) -> dict:
     stats = {"calls": 0, "turns": 0, "events": 0, "files": 0}
     job_by_name = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM jobs")}
-    for path in log_files():
+    if not full and get_watermark(conn, AUX_BACKFILL_KEY) is None:
+        # aux.failed events are newer than the read offsets: read what is already behind
+        # them once, so the first detection sees the last day and not an empty window.
+        stats["aux_backfill"] = _aux_backfill(conn)
+    for profile, path in log_files():
         try:
             st = path.stat()
         except OSError:
@@ -111,20 +183,77 @@ def ingest(conn: sqlite3.Connection, full: bool = False) -> dict:
             batch.append(rec)
             end = rec[0]
             if len(batch) >= 2000:
-                _apply(conn, batch, stats, job_by_name)
+                _apply(conn, batch, stats, job_by_name, profile, path)
                 with Tx(conn):
                     set_watermark(conn, key, end)
                 batch = []
         if batch:
-            _apply(conn, batch, stats, job_by_name)
+            _apply(conn, batch, stats, job_by_name, profile, path)
         with Tx(conn):
             set_watermark(conn, key, end)
+    if full:
+        with Tx(conn):
+            set_watermark(conn, AUX_BACKFILL_KEY, 1)
     return stats
 
 
-def _apply(conn, batch, stats, job_by_name) -> None:
+def _aux_backfill(conn) -> int:
+    """One pass over what the offsets already cover; everything after them the normal pass reads."""
+    n = 0
+    for profile, path in log_files():
+        batch = []
+        try:
+            st = path.stat()
+            behind = int(get_watermark(conn, f"log:{st.st_dev}:{st.st_ino}", 0) or 0)
+            if behind <= 0 or behind > st.st_size:
+                continue
+            for rec in _records(path, 0):
+                if rec[0] > behind:
+                    break
+                if rec[4] in _AUX_LOGGERS:
+                    batch.append(rec)
+        except OSError:
+            continue
+        with Tx(conn):
+            for _end, ts, level, session, logger, msg in batch:
+                n += _aux(conn, ts, level, session, logger, msg, profile, path)
+    with Tx(conn):
+        set_watermark(conn, AUX_BACKFILL_KEY, 1)
+    return n
+
+
+_AUX_LOGGERS = {lg for _t, lgs, _rx in AUX_PATTERNS for lg in lgs}
+
+
+def _aux(conn, ts, level, session, logger, msg, profile, path) -> int:
+    if logger not in _AUX_LOGGERS:
+        return 0
+    hit = aux_match(logger, msg)
+    if not hit:
+        return 0
+    task, sig, error = hit
+    if sig == "result=error" and conn.execute(
+            "SELECT 1 FROM events WHERE kind='aux.failed' AND session_id IS ? AND at BETWEEN ? AND ? "
+            "AND json_extract(detail, '$.task')=? AND json_extract(detail, '$.profile')=? "
+            "AND json_extract(detail, '$.sig')!='result=error' LIMIT 1",
+            (session, ts - MATCH_WINDOW_S, ts + 0.001, task, profile)).fetchone():
+        return 0  # the "review failed: …" line just before already counted this review
+    from ..textutil import redact
+    stamp = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    first = msg.split("\n", 1)[0]
+    line = redact(f"{stamp} {level} " + (f"[{session}] " if session else "") + f"{logger}: {first}")[:300]
+    detail = {"profile": profile, "task": task, "sig": sig, "error": redact(error.split("\n", 1)[0])[:300]}
+    # the file is left out of the dedupe key: a rotated log must not count a line twice
+    _event(conn, ts, "aux.failed", session, None, detail, extra={"line": line, "logger": logger, "file": str(path)})
+    return 1
+
+
+def _apply(conn, batch, stats, job_by_name, profile="default", path="") -> None:
     with Tx(conn):
         for _end, ts, level, session, logger, msg in batch:
+            if _aux(conn, ts, level, session, logger, msg, profile, path):
+                stats["aux_failed"] = stats.get("aux_failed", 0) + 1
+                continue
             if logger == "agent.conversation_loop" and session:
                 m = API_CALL.match(msg)
                 if m:
@@ -178,10 +307,11 @@ def _apply(conn, batch, stats, job_by_name) -> None:
                     break
 
 
-def _event(conn, ts, kind, session, job, detail) -> None:
+def _event(conn, ts, kind, session, job, detail, extra=None) -> None:
     dedupe = hashlib.sha1(f"{ts:.3f}|{kind}|{session}|{job}|{json.dumps(detail, sort_keys=True)}".encode()).hexdigest()
     conn.execute("INSERT OR IGNORE INTO events(at, kind, session_id, job_id, detail, origin, dedupe) "
-                 "VALUES(?,?,?,?,?,?,?)", (ts, kind, session, job, json.dumps(detail), "log", dedupe))
+                 "VALUES(?,?,?,?,?,?,?)", (ts, kind, session, job, json.dumps({**detail, **(extra or {})}), "log",
+                                           dedupe))
 
 
 def _call(conn, ts, session, m) -> None:
