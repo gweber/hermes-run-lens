@@ -42,10 +42,25 @@ const passthrough = (name, tag = "div") => function Stub(props) {
   if (name === "Button" || name === "TabsTrigger") safe["data-stub"] = name;
   return React.createElement(tag, safe, children);
 };
+
+// The real SDK Select (@nous-research/ui) is a popup that calls only
+// onValueChange(value) and drops every other prop. A native <select> stub that
+// kept onChange hid five plugins' dead dropdowns (15.09.2026), so this stub
+// follows the real contract and refuses onChange outright.
+function SelectStub(props) {
+  const { children, onChange, onValueChange, ...rest } = props || {};
+  if (onChange) throw new Error("C.Select ignores onChange; the SDK only calls onValueChange(value)");
+  used.add("Select");
+  return React.createElement("select", {
+    value: rest.value, disabled: rest.disabled, id: rest.id, className: rest.className,
+    onChange: (e) => onValueChange && onValueChange(e.target.value),
+  }, children);
+}
+
 const components = {
   Card: passthrough("Card"), CardHeader: passthrough("CardHeader"), CardTitle: passthrough("CardTitle"),
   CardContent: passthrough("CardContent"), Badge: passthrough("Badge", "span"), Button: passthrough("Button", "button"),
-  Input: passthrough("Input", "input"), Select: passthrough("Select", "select"), SelectOption: passthrough("SelectOption", "option"),
+  Input: passthrough("Input", "input"), Select: SelectStub, SelectOption: passthrough("SelectOption", "option"),
   TabsList: passthrough("TabsList"), TabsTrigger: passthrough("TabsTrigger", "button"),
   Tabs: function Tabs(props) {
     used.add("Tabs");

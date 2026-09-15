@@ -153,7 +153,7 @@
 
   function SinceSelect({ value, onChange, options }) {
     const opts = options || [["1h", "1 hour"], ["6h", "6 hours"], ["24h", "24 hours"], ["3d", "3 days"], ["7d", "7 days"], ["14d", "14 days"]];
-    return h(C.Select, { value, onChange: (e) => onChange(e && e.target ? e.target.value : e) },
+    return h(C.Select, { value, onValueChange: (e) => onChange(e && e.target ? e.target.value : e) },
       opts.map(([v, l]) => h(C.SelectOption, { key: v, value: v }, l)));
   }
 
@@ -328,9 +328,9 @@
     return h("div", null,
       h("div", { className: "mb-4 flex flex-wrap items-center gap-2" },
         h(SinceSelect, { value: since, onChange: setSince }),
-        h(C.Select, { value: source, onChange: (e) => setSource(e && e.target ? e.target.value : e) },
+        h(C.Select, { value: source, onValueChange: (e) => setSource(e && e.target ? e.target.value : e) },
           sources.map((s) => h(C.SelectOption, { key: s, value: s }, s || "all sources"))),
-        h(C.Select, { value: sort, onChange: (e) => setSort(e && e.target ? e.target.value : e) },
+        h(C.Select, { value: sort, onValueChange: (e) => setSort(e && e.target ? e.target.value : e) },
           [["started", "newest"], ["calls", "most calls"], ["tokens", "most tokens"], ["wall", "longest"]]
             .map(([v, l]) => h(C.SelectOption, { key: v, value: v }, l))),
         h(C.Button, { variant: active ? "default" : "outline", size: "sm", onClick: () => setActive(!active) },
@@ -567,11 +567,11 @@
     const rows = kind ? all.filter((f) => f.kind === kind) : all;
     return h("div", null,
       h("div", { className: "mb-4 flex flex-wrap items-center gap-2" },
-        h(C.Select, { value: state, onChange: (e) => setStateFilter(e && e.target ? e.target.value : e) },
+        h(C.Select, { value: state, onValueChange: (e) => setStateFilter(e && e.target ? e.target.value : e) },
           [["open", "open"], ["acked", "acknowledged"], ["resolved", "resolved"], ["all", "all"]].map(([v, l]) => h(C.SelectOption, { key: v, value: v }, l))),
-        h(C.Select, { value: severity, onChange: (e) => setSeverity(e && e.target ? e.target.value : e) },
+        h(C.Select, { value: severity, onValueChange: (e) => setSeverity(e && e.target ? e.target.value : e) },
           [["info", "info and up"], ["warn", "warn and up"], ["high", "high and up"], ["critical", "critical"]].map(([v, l]) => h(C.SelectOption, { key: v, value: v }, l))),
-        h(C.Select, { value: kind, onChange: (e) => setKind(e && e.target ? e.target.value : e) },
+        h(C.Select, { value: kind, onValueChange: (e) => setKind(e && e.target ? e.target.value : e) },
           [h(C.SelectOption, { key: "", value: "" }, "all kinds")].concat(kinds.map((k) => h(C.SelectOption, { key: k, value: k }, k)))),
         h(Muted, { className: "text-xs" }, loading ? "loading…" : `${rows.length} findings`)),
       error ? h(Note, { tone: "error", message: error }) : null,
